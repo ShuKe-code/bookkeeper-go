@@ -3,8 +3,6 @@ package bookkeepergo
 import (
 	"sync"
 	"time"
-
-	"github.com/pingcap/log"
 )
 
 var queueEntryPool sync.Pool = sync.Pool{
@@ -35,7 +33,7 @@ func NewQueueEntry(ledgerId uint64, entryId uint64, entry []byte,
 }
 
 func (qe *queueEntry) run() {
-	log.Debug("Acknowledge Ledger: {}, Entry: {}", qe.ledgerId, qe.entryId)
+	// log.Debug("Acknowledge Ledger: %d, Entry: %d", qe.ledgerId, qe.entryId)
 	elapsedNanos := time.Now().UnixNano() - qe.enqueueTime
 	journalAddEntryStats.WithLabelValues("true").Observe(float64(elapsedNanos))
 	qe.cb.writeComplete(0, qe.ledgerId, qe.entryId)

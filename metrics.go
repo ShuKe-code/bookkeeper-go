@@ -9,7 +9,7 @@ const (
 )
 
 var (
-	forceWriteQueueSize             prometheus.Counter
+	forceWriteQueueSize             prometheus.GaugeFunc
 	flushMaxWaitCounter             prometheus.Counter
 	flushMaxOutstandingBytesCounter prometheus.Counter
 	journalQueueSize                prometheus.Counter
@@ -45,15 +45,6 @@ func init() {
 			Help:      "The number of bytes appended to the journal",
 		})
 	_ = prometheus.Register(journalWriteBytes)
-
-	forceWriteQueueSize = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Namespace: PromNameSpace,
-			Subsystem: "",
-			Name:      "JOURNAL_FORCE_WRITE_QUEUE_SIZE",
-			Help:      "The force write queue size",
-		})
-	_ = prometheus.Register(forceWriteQueueSize)
 
 	flushMaxWaitCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
@@ -170,4 +161,15 @@ func init() {
 		Buckets:   []float64{1, 5, 10, 50, 100, 250, 500, 1000, 2500, 5000, 10000},
 	}, []string{"success"})
 	_ = prometheus.Register(journalQueueStats)
+}
+
+func initForceWriteQueueSize(function func() float64) {
+	forceWriteQueueSize = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: PromNameSpace,
+			Subsystem: "",
+			Name:      "JOURNAL_FORCE_WRITE_QUEUE_SIZE",
+			Help:      "The force write queue size",
+		}, function)
+	_ = prometheus.Register(forceWriteQueueSize)
 }

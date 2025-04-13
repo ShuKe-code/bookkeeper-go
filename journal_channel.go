@@ -1,17 +1,16 @@
 package bookkeepergo
 
 import (
-	"bytes"
+	"encoding/binary"
 	"os"
 	"strconv"
-
-	"github.com/pingcap/log"
 )
 
 const (
 	HEADER_SIZE       = 512
 	V5                = 5
 	MB                = 1024 * 1024
+	KB                = 1024
 	cacheDropLagBytes = 8 * MB
 )
 
@@ -57,7 +56,7 @@ func NewJournalChannel(journalAlignSize int64, preAllocSize int64, fRemoveFromPa
 	jc.zeros = make([]byte, jc.journalAlignSize)
 	fileName := journalDirectory + strconv.FormatInt(logID, 16) + ".txn"
 
-	log.Info("Opening journal {}", journalDirectory)
+	log.Info("Opening journal %s", journalDirectory)
 	if PathExists(fileName) { // open an existing file to read.
 
 	} else { // create new journal file to write, write version
@@ -68,17 +67,20 @@ func NewJournalChannel(journalAlignSize int64, preAllocSize int64, fRemoveFromPa
 		}
 		jc.fd = fd
 		jc.writeHeader()
-		jc.bc = NewBufferChannel(jc.writeBufferSize)
 	}
 
 	return jc
 }
 
 func (jc *journalChannel) writeHeader() {
-	byteBuf := bytes.NewBuffer(make([]byte, HEADER_SIZE))
-	byteBuf.Write(magicWord)
-	byteBuf.Write([]byte{V5, 0, 0, 0})
-	jc.fd.Write(byteBuf.Bytes())
+	headSlice := make([]byte, 8)
+	copy(headSlice[:4], magicWord)
+	binary.BigEndian.PutUint32(headSlice[4:], uint32(V5))
+	otherHeader := make([]byte, HEADER_SIZE-8)
+	jc.fd.Write(headSlice)
+	jc.fd.Write(otherHeader)
+	jc.bc = NewBufferChannel(jc.writeBufferSize, 0, jc.fd)
+
 	jc.forceWrite(true)
 	jc.nextPrealloc = jc.preAllocSize
 	jc.fd.WriteAt(jc.zeros, jc.nextPrealloc-jc.journalAlignSize)
@@ -104,6 +106,7 @@ func (jc *journalChannel) forceWrite(forceMetadata bool) error {
 		}
 		jc.lastDropPosition = newDropPos
 	}
+	return nil
 }
 
 func bestEffortRemoveFromPageCache(file *os.File, offset int64, length int64) error {

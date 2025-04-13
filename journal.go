@@ -8,8 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/pingcap/log"
 )
 
 const (
@@ -34,30 +32,52 @@ type journal struct {
 	lastMarkFileName                  string
 	flushWhenQueueEmpty               bool
 	running                           bool
+	forceWriteQueueSize               int64
 }
 
 func NewJournal(journalDirectory string, cfg *Config) *journal {
+	fixConfig(cfg)
+
 	return &journal{
-		journalDirectory: journalDirectory,
-		config:           cfg,
+		journalDirectory:                  journalDirectory,
+		config:                            cfg,
+		maxJournalSize:                    cfg.journalMaxSizeMB * MB,
+		journalPreAllocSize:               cfg.journalPreAllocSizeMB * MB,
+		journalWriteBufferSize:            cfg.journalWriteBufferSizeKB * KB,
+		syncData:                          cfg.journalSyncData,
+		maxBackupJournals:                 int(cfg.journalMaxBackups),
+		maxGroupWaitInNanos:               cfg.journalMaxGroupWaitMSec * int64(time.Millisecond),
+		bufferedWritesThreshold:           cfg.journalBufferedWritesThreshold,
+		bufferedEntriesThreshold:          cfg.journalBufferedEntriesThreshold,
+		journalAlignmentSize:              cfg.journalAlignmentSize,
+		journalPageCacheFlushIntervalMSec: cfg.journalPageCacheFlushIntervalMSec,
+		removePagesFromCache:              cfg.journalRemoveFromPageCache,
+		lastMarkFileName:                  LAST_MARK_DEFAULT_NAME,
+		flushWhenQueueEmpty:               cfg.journalFlushWhenQueueEmpty,
+		queue:                             make(chan *queueEntry, cfg.journalQueueSize),
 	}
 }
 
-func (j *journal) StartForceWrite(forceWriteChannel chan *ForceWriteRequest) {
+func (j *journal) logAddEntry(ledgerId, entryId uint64, entry []byte, ackBeforeSync bool, cb WriteCallback) {
+	journalQueueSize.Inc()
+	j.queue <- NewQueueEntry(ledgerId, entryId, entry, time.Now().UnixNano(), ackBeforeSync, cb)
+}
+
+func (j *journal) startForceWrite(forceWriteChannel chan *ForceWriteRequest) {
 	log.Info("ForceWrite Thread started")
+	initForceWriteQueueSize(func() float64 { return float64(len(forceWriteChannel)) })
 	numEntriesInLastForceWrite := 0
 	localRequests := make([]*ForceWriteRequest, j.config.journalQueueSize)
-	localRequestsIndex := 0
-	writeHandlers := list.New()
+	var localRequestsIndex int64
+	var writeHandlers *list.List
+
 	for {
-		writeHandlers.Init()
+		writeHandlers = list.New()
 		numEntriesInLastForceWrite = 0
 		localRequestsIndex = 0
-		select {
-		case fwr := <-forceWriteChannel:
-			localRequests[localRequestsIndex] = fwr
-			localRequestsIndex++
-		}
+		fwr := <-forceWriteChannel
+		localRequests[localRequestsIndex] = fwr
+		localRequestsIndex++
 		// dequeue force write requests
 	dequeLoop:
 		for {
@@ -65,21 +85,23 @@ func (j *journal) StartForceWrite(forceWriteChannel chan *ForceWriteRequest) {
 			case fwr := <-forceWriteChannel:
 				localRequests[localRequestsIndex] = fwr
 				localRequestsIndex++
+				if localRequestsIndex == j.config.journalQueueSize {
+					break dequeLoop
+				}
 			default:
 				break dequeLoop
 			}
 		}
 		// Sync and mark the journal up to the position of the last entry in the batch
 		lastRequest := localRequests[localRequestsIndex-1]
-		forceWriteQueueSize.Add(float64(-localRequestsIndex))
+		j.forceWriteQueueSize -= localRequestsIndex
 		j.syncJournal(lastRequest)
-
-		for i := 0; i < localRequestsIndex; i++ {
+		var i int64
+		for i = 0; i < localRequestsIndex; i++ {
 			req := localRequests[i]
 			numEntriesInLastForceWrite += req.process(*writeHandlers)
 			req.release()
 		}
-		forceWriteQueueSize.Add(float64(numEntriesInLastForceWrite))
 		forceWriteGroupingCountStats.WithLabelValues("true").Observe(float64(numEntriesInLastForceWrite))
 	}
 }
@@ -91,16 +113,17 @@ func (j *journal) syncJournal(lastRequest *ForceWriteRequest) {
 	journalSyncStats.WithLabelValues("true").Observe(float64(fsyncStartTime))
 }
 
-func (j *journal) startJournal(entry *queueEntry) {
-	log.Info("Starting journal on ", j.journalDirectory)
+func (j *journal) startJournal() {
+	log.Info("Starting journal on %s", j.journalDirectory)
+	j.running = true
 	toFlush := list.New()
 	numEntriesToFlush := 0
-	lenBuff := make([]byte, 4)
+	var lenBuff []byte
 	var bc BufferChannel
 	var logFile *journalChannel
 	forceWriteQueue := make(chan *ForceWriteRequest, j.config.journalQueueSize)
-	queue := make(chan *queueEntry, j.config.journalQueueSize)
-	go j.StartForceWrite(forceWriteQueue)
+	queue := j.queue
+	go j.startForceWrite(forceWriteQueue)
 	batchSize := 0
 
 	journalIds, err := ListJournalIds(j.journalDirectory, nil)
@@ -140,25 +163,24 @@ func (j *journal) startJournal(entry *queueEntry) {
 			localQueueEntriesIdx = 0
 			localQueueEntriesLen = 0
 			if numEntriesToFlush == 0 {
-				select {
-				case qe = <-queue:
-					localQueueEntries[localQueueEntriesIdx] = qe
-					localQueueEntriesIdx++
-					localQueueEntriesLen++
-				}
+				qe = <-queue
+				localQueueEntries[localQueueEntriesLen] = qe
+				localQueueEntriesLen++
 			loop1:
 				for {
 					select {
 					case qe = <-queue:
-						localQueueEntries[localQueueEntriesIdx] = qe
-						localQueueEntriesIdx++
+						localQueueEntries[localQueueEntriesLen] = qe
 						localQueueEntriesLen++
+						if localQueueEntriesLen == len(localQueueEntries) {
+							break loop1
+						}
 					default:
 						break loop1
 					}
 				}
 			} else {
-				pollWaitTimeNanos := j.maxGroupWaitInNanos - toFlush.Front().Value.(*queueEntry).enqueueTime
+				pollWaitTimeNanos := j.maxGroupWaitInNanos - (time.Now().UnixNano() - toFlush.Front().Value.(*queueEntry).enqueueTime)
 				if pollWaitTimeNanos < 0 {
 					pollWaitTimeNanos = 0
 				}
@@ -166,9 +188,11 @@ func (j *journal) startJournal(entry *queueEntry) {
 				for {
 					select {
 					case qe = <-queue:
-						localQueueEntries[localQueueEntriesIdx] = qe
-						localQueueEntriesIdx++
+						localQueueEntries[localQueueEntriesLen] = qe
 						localQueueEntriesLen++
+						if localQueueEntriesLen == len(localQueueEntries) {
+							break loop2
+						}
 					case <-time.After(time.Duration(pollWaitTimeNanos) * time.Nanosecond):
 						break loop2
 					}
@@ -217,10 +241,10 @@ func (j *journal) startJournal(entry *queueEntry) {
 				for item := toFlush.Front(); item != nil; item = item.Next() {
 					entry := item.Value.(*queueEntry)
 					if entry != nil && (!j.syncData || entry.ackBeforeSync) {
-						item.Value = nil
 						numEntriesToFlush--
+						entry.run()
+						item.Value = nil
 					}
-					entry.run()
 				}
 				writeHandlers.Init()
 				lastFlushPosition = bc.position()
@@ -230,8 +254,9 @@ func (j *journal) startJournal(entry *queueEntry) {
 				shouldRolloverJournal := lastFlushPosition > j.maxJournalSize
 				if j.syncData || shouldRolloverJournal || time.Now().UnixNano()-lastFlushTimeMs > j.journalPageCacheFlushIntervalMSec {
 					forceWriteQueue <- NewForceWriteRequest(logFile, logId, shouldRolloverJournal, uint64(lastFlushPosition), toFlush)
+					j.forceWriteQueueSize++
 				}
-				toFlush.Init()
+				toFlush = list.New()
 				numEntriesToFlush = 0
 				batchSize = 0
 				if shouldRolloverJournal {
@@ -244,7 +269,7 @@ func (j *journal) startJournal(entry *queueEntry) {
 			log.Info("Journal Manager is asked to shut down, quit.")
 			break
 		}
-		if qe != nil {
+		if qe == nil {
 			continue
 		}
 		journalQueueSize.Desc()
@@ -254,6 +279,7 @@ func (j *journal) startJournal(entry *queueEntry) {
 		journalWriteBytes.Add(float64(entrySize))
 
 		batchSize += (4 + entrySize)
+		lenBuff = make([]byte, 4)
 		binary.BigEndian.PutUint32(lenBuff, uint32(entrySize))
 
 		logFile.preAllocIfNeeded(int64(entrySize + 4))
@@ -270,7 +296,6 @@ func (j *journal) startJournal(entry *queueEntry) {
 			qe = nil
 		}
 	}
-
 }
 
 type JournalIdFilter interface {

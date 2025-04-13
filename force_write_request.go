@@ -22,7 +22,6 @@ type ForceWriteRequest struct {
 
 func NewForceWriteRequest(logFile *journalChannel, logId int64, shouldClose bool,
 	lastFlushedPosition uint64, forceWriteWaiters *list.List) *ForceWriteRequest {
-
 	fwr := forceWriteRequestPool.Get().(*ForceWriteRequest)
 	fwr.flushed = false
 	fwr.logFile = logFile
@@ -30,7 +29,6 @@ func NewForceWriteRequest(logFile *journalChannel, logId int64, shouldClose bool
 	fwr.lastFlushedPosition = lastFlushedPosition
 	fwr.logId = logId
 	fwr.forceWriteWaiters = forceWriteWaiters
-	forceWriteQueueSize.Inc()
 	return fwr
 }
 
@@ -54,8 +52,8 @@ func (fwr *ForceWriteRequest) process(writeHandlers list.List) int {
 	for e := fwr.forceWriteWaiters.Front(); e != nil; e = e.Next() {
 		if e.Value != nil {
 			writeHandlers.PushBack(e.Value)
+			e.Value.(*queueEntry).run()
 		}
-		e.Value.(*queueEntry).run()
 	}
 	return fwr.forceWriteWaiters.Len()
 }
