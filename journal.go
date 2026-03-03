@@ -3,7 +3,11 @@ package bookkeepergo
 import (
 	"container/list"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"os"
+	"path"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,7 +15,8 @@ import (
 )
 
 const (
-	LAST_MARK_DEFAULT_NAME = "lastMark"
+	LAST_MARK_DEFAULT_NAME        = "lastMark"
+	PADDING_MASK           uint32 = 0xFFFFFF00
 )
 
 type journal struct {
@@ -33,11 +38,23 @@ type journal struct {
 	flushWhenQueueEmpty               bool
 	running                           bool
 	forceWriteQueueSize               int64
+	lastLogMark                       *lastLogMark
 }
 
-func NewJournal(journalDirectory string, cfg *Config) *journal {
+func NewJournal(journalIndex int, journalDirectory string, cfg *Config,
+	ledgerDirsManager *ledgerDirsManager) *journal {
 	fixConfig(cfg)
 
+	var lastMarkFileName string
+	if len(cfg.getJournalDirs()) == 1 {
+		lastMarkFileName = LAST_MARK_DEFAULT_NAME
+	} else {
+		lastMarkFileName = fmt.Sprintf("%s.%d", LAST_MARK_DEFAULT_NAME, journalIndex)
+	}
+
+	lastLogMark := newLastLogMark(0, 0, ledgerDirsManager, lastMarkFileName)
+	lastLogMark.readLog()
+	log.Debug("Last Log Mark : %v", lastLogMark.getCurMark())
 	return &journal{
 		journalDirectory:                  journalDirectory,
 		config:                            cfg,
@@ -55,6 +72,7 @@ func NewJournal(journalDirectory string, cfg *Config) *journal {
 		lastMarkFileName:                  LAST_MARK_DEFAULT_NAME,
 		flushWhenQueueEmpty:               cfg.journalFlushWhenQueueEmpty,
 		queue:                             make(chan *queueEntry, cfg.journalQueueSize),
+		lastLogMark:                       lastLogMark,
 	}
 }
 
@@ -65,12 +83,15 @@ func (j *journal) logAddEntry(ledgerId, entryId uint64, entry []byte, ackBeforeS
 
 func (j *journal) startForceWrite(forceWriteChannel chan *ForceWriteRequest) {
 	log.Info("ForceWrite Thread started")
-	initForceWriteQueueSize(func() float64 { return float64(len(forceWriteChannel)) })
+	initForceWriteQueueSize(func() float64 { return float64(j.forceWriteQueueSize) })
 	numEntriesInLastForceWrite := 0
 	localRequests := make([]*ForceWriteRequest, j.config.journalQueueSize)
 	var localRequestsIndex int64
 	var writeHandlers *list.List
-
+	if j.config.enableBusyWait {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
 	for {
 		writeHandlers = list.New()
 		numEntriesInLastForceWrite = 0
@@ -111,6 +132,50 @@ func (j *journal) syncJournal(lastRequest *ForceWriteRequest) {
 	lastRequest.flushFileToDisk()
 	fsyncStartTime = time.Now().UnixNano() - fsyncStartTime
 	journalSyncStats.WithLabelValues("true").Observe(float64(fsyncStartTime))
+	j.lastLogMark.setCurLogMark(lastRequest.logId, int64(lastRequest.lastFlushedPosition))
+}
+
+
+func (j *journal) scanJournal(journalId, journalPos int64, scanner JournalScanner, skipInvalidRecord bool) int64 {
+	recLog := newJournalChannel(j.journalAlignmentSize, j.journalPreAllocSize, j.removePagesFromCache,
+		j.journalDirectory, journalId, j.journalWriteBufferSize, journalPos)
+
+	lenBuff := make([]byte, 4)
+	recBuff := make([]byte, 64*1024)
+	for {
+		offset, _ := recLog.fd.Seek(0, io.SeekCurrent)
+		clearLenbuf(lenBuff)
+		if _, err := recLog.fd.Read(lenBuff); err != nil {
+			break
+		}
+		length := int(binary.BigEndian.Uint32(lenBuff))
+		if length == 0 {
+			break
+		}
+		isPaddingRecord := false
+		if uint32(length) == PADDING_MASK {
+			// skip padding bytes
+			isPaddingRecord = true
+			clearLenbuf(lenBuff)
+			if _, err := recLog.fd.Read(lenBuff); err != nil {
+				break
+			}
+			length = int(binary.BigEndian.Uint32(lenBuff))
+			if length == 0 {
+				continue
+			}
+		}
+		clearLenbuf(recBuff)
+		if len(recBuff) < length {
+			recBuff = make([]byte, length)
+		}
+		recLog.fd.Read(recBuff[:length])
+		if !isPaddingRecord {
+			scanner.process(0, offset, recBuff[:length])
+		}
+	}
+	offset, _ := recLog.fd.Seek(0, io.SeekCurrent)
+	return  offset
 }
 
 func (j *journal) startJournal() {
@@ -118,7 +183,11 @@ func (j *journal) startJournal() {
 	j.running = true
 	toFlush := list.New()
 	numEntriesToFlush := 0
-	var lenBuff []byte
+	var lenBuff = make([]byte, 4)
+
+	var paddingBuffer = make([]byte, j.config.journalAlignmentSize*2)
+	binary.BigEndian.PutUint32(paddingBuffer, uint32(PADDING_MASK))
+
 	var bc BufferChannel
 	var logFile *journalChannel
 	forceWriteQueue := make(chan *ForceWriteRequest, j.config.journalQueueSize)
@@ -129,7 +198,6 @@ func (j *journal) startJournal() {
 	journalIds, err := ListJournalIds(j.journalDirectory, nil)
 	if err != nil {
 		log.Error("Failed to list journal ids")
-		return
 	}
 	logId := time.Now().UnixMilli()
 	if len(journalIds) > 0 {
@@ -146,12 +214,17 @@ func (j *journal) startJournal() {
 	localQueueEntriesIdx := 0
 	localQueueEntriesLen := 0
 	var qe *queueEntry
+
+	if j.config.enableBusyWait {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
 	for {
 		if logFile == nil {
 			logId = logId + 1
 			journalCreationWatcher = time.Now().UnixNano()
-			logFile = NewJournalChannel(j.journalAlignmentSize, j.journalPreAllocSize, j.removePagesFromCache,
-				j.journalDirectory, logId, j.journalWriteBufferSize)
+			logFile = newJournalChannel(j.journalAlignmentSize, j.journalPreAllocSize, j.removePagesFromCache,
+				j.journalDirectory, logId, j.journalWriteBufferSize, 0)
 			journalCreationStats.WithLabelValues("true").Observe(float64(time.Now().UnixNano() - journalCreationWatcher))
 			bc = logFile.getBufferedChannel()
 			lastFlushPosition = bc.position()
@@ -236,6 +309,7 @@ func (j *journal) startJournal() {
 				flushEmptyQueueCounter.Inc()
 			}
 			if shouldFlush {
+				j.writePaddingBytes(logFile, j.journalAlignmentSize, paddingBuffer)
 				journalFlushWatcher = time.Now().UnixNano()
 				bc.flush()
 				for item := toFlush.Front(); item != nil; item = item.Next() {
@@ -252,6 +326,9 @@ func (j *journal) startJournal() {
 				forceWriteBatchBytesStats.WithLabelValues("true").Observe(float64(batchSize))
 				forceWriteBatchEntriesStats.WithLabelValues("true").Observe(float64(numEntriesToFlush))
 				shouldRolloverJournal := lastFlushPosition > j.maxJournalSize
+				if shouldRolloverJournal {
+					fmt.Println("shouldRolloverJournal:", shouldRolloverJournal, "lastFlushPosition:", lastFlushPosition, "maxJournalSize:", j.maxJournalSize)
+				}
 				if j.syncData || shouldRolloverJournal || time.Now().UnixNano()-lastFlushTimeMs > j.journalPageCacheFlushIntervalMSec {
 					forceWriteQueue <- NewForceWriteRequest(logFile, logId, shouldRolloverJournal, uint64(lastFlushPosition), toFlush)
 					j.forceWriteQueueSize++
@@ -279,7 +356,7 @@ func (j *journal) startJournal() {
 		journalWriteBytes.Add(float64(entrySize))
 
 		batchSize += (4 + entrySize)
-		lenBuff = make([]byte, 4)
+		clearLenbuf(lenBuff)
 		binary.BigEndian.PutUint32(lenBuff, uint32(entrySize))
 
 		logFile.preAllocIfNeeded(int64(entrySize + 4))
@@ -298,12 +375,85 @@ func (j *journal) startJournal() {
 	}
 }
 
+func (j *journal) writePaddingBytes(jc *journalChannel, journalAlignSize int64, paddingBuffer []byte) {
+	bytesToAlign := jc.bc.position() % journalAlignSize
+	if bytesToAlign != 0 {
+		paddingBytes := journalAlignSize - bytesToAlign
+		if paddingBytes < 8 {
+			paddingBytes = journalAlignSize - (8 - paddingBytes)
+		} else {
+			paddingBytes -= 8
+		}
+		clearLenbuf(paddingBuffer[4:8])
+		binary.BigEndian.PutUint32(paddingBuffer[4:], uint32(paddingBytes))
+		len := 8 + paddingBytes
+		jc.preAllocIfNeeded(len)
+		jc.bc.write(paddingBuffer[:len])
+	}
+}
+
+func (j *journal) getLastLogMark() *lastLogMark {
+	return j.lastLogMark
+}
+
+func (j *journal) setLastLogMark(id, offset int64) {
+	j.lastLogMark.setCurLogMark(id, offset)
+}
+
+func (j *journal) newCheckpoint() Checkpoint {
+	return &logMarkCheckpoint{
+		mark: j.lastLogMark.markLog(),
+	}
+}
+
+func (j *journal) checkpointComplete(checkpoint Checkpoint, compact bool) error {
+	lmcheckpoint, ok := checkpoint.(*logMarkCheckpoint)
+	if !ok {
+		return nil
+	}
+	mark := lmcheckpoint.mark
+	mark.rollLog()
+	if compact {
+		logs, err := ListJournalIds(j.journalDirectory, &journalRollingFilter{mark})
+		if err != nil {
+			return err
+		}
+		if len(logs) > j.maxBackupJournals {
+			maxIdx := len(logs) - j.maxBackupJournals
+			for i := 0; i < maxIdx; i++ {
+				id := logs[i]
+				if id < int64(j.lastLogMark.getCurMark().getLogFileId()) {
+					fileName := path.Join(j.journalDirectory, fmt.Sprintf("%016x.txn", id))
+					if err := os.Remove(fileName); err != nil {
+						log.Warn("Could not delete old journal file %s", fileName)
+					} else {
+						log.Info("garbage collected journal %s", fileName)
+					}
+				}
+			}
+		}
+	}
+	return nil
+
+}
+
 type JournalIdFilter interface {
 	Accept(id int64) bool
 }
 
+type journalRollingFilter struct {
+	lastMark *lastLogMark
+}
+
+func (jrf *journalRollingFilter) Accept(id int64) bool {
+	return id < int64(jrf.lastMark.getCurMark().getLogFileId())
+}
+
 // ListJournalIds lists journal IDs in the specified directory, applying the optional filter.
 func ListJournalIds(journalDir string, filter JournalIdFilter) ([]int64, error) {
+	if err := createDirectory(journalDir); err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(journalDir)
 	if err != nil {
 		return nil, err
@@ -335,4 +485,24 @@ func ListJournalIds(journalDir string, filter JournalIdFilter) ([]int64, error) 
 		return ids[i] < ids[j]
 	})
 	return ids, nil
+}
+
+func createDirectory(dirPath string) error {
+	f, e := os.Stat(dirPath)
+	if e != nil {
+		if os.IsNotExist(e) {
+			return os.MkdirAll(dirPath, 0755)
+		}
+		return fmt.Errorf("failed to create dir %s: %v", dirPath, e)
+	}
+	if !f.IsDir() {
+		return fmt.Errorf("failed to create dir %s: dir path already exists and is not a directory", dirPath)
+	}
+	return e
+}
+
+func clearLenbuf(lenBuff []byte) {
+	for i := 0; i < len(lenBuff); i++ {
+		lenBuff[i] = 0
+	}
 }

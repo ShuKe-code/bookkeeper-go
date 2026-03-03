@@ -10,4 +10,5 @@ type nopWriteCallback struct {
 
 func (nwc *nopWriteCallback) writeComplete(rd int, ledgerId uint64, entryId uint64) {
 	nwc.cb()
+	// fmt.Println("write complete, ledgerId:", ledgerId, "entryId:", entryId)
 }

@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+
+package bookkeeper.protol.ledger_data;
+option go_package = "bookkeeper-go/proto";
+
+
+message LedgerData {
+    bool exists = 1;
+    bool fenced = 2;
+    bytes masterKey = 3;
+    bytes explicitLac = 4;
+    bool limbo = 5;
+}
